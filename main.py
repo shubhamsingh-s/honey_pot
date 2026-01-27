@@ -1,30 +1,52 @@
+import os
+import re
+from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Dict
-import re
-import random
+import uvicorn
 
-app = FastAPI()
+import google.generativeai as genai
 
-API_KEY = "honeypot-secret-123"   # same key jo GUVI me dala hai
+# =========================
+# Environment variables
+# =========================
+API_KEY = os.getenv("API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ------------------ Models ------------------
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not set")
 
-class Message(BaseModel):
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(
+    title="Agentic Honeypot API",
+    description="Autonomous scam-engagement honeypot for intelligence extraction",
+    version="1.0.0"
+)
+
+# =========================
+# Data Models
+# =========================
+class MessageData(BaseModel):
     sender: str
     text: str
-    timestamp: str
+    timestamp: Optional[str] = None
 
 class HoneypotRequest(BaseModel):
     sessionId: str
-    message: Message
-    conversationHistory: Optional[List[Dict]] = []
+    message: MessageData
+    conversationHistory: Optional[List[Dict[str, Any]]] = None
 
 class Intelligence(BaseModel):
-    upiIds: List[str] = []
-    phishingLinks: List[str] = []
-    phoneNumbers: List[str] = []
-    suspiciousKeywords: List[str] = []
+    upiIds: List[str]
+    phishingLinks: List[str]
+    phoneNumbers: List[str]
+    suspiciousKeywords: List[str]
 
 class HoneypotResponse(BaseModel):
     status: str
@@ -32,55 +54,88 @@ class HoneypotResponse(BaseModel):
     agentReply: Optional[str]
     extractedIntelligence: Intelligence
 
-# ------------------ Logic ------------------
-
-SCAM_KEYWORDS = ["blocked", "verify", "urgent", "kyc", "otp", "bank"]
-
-def detect_scam(text: str):
-    found = [k for k in SCAM_KEYWORDS if k in text.lower()]
-    return len(found) > 0, found
-
-def extract_intel(text: str) -> Intelligence:
-    return Intelligence(
-        upiIds=re.findall(r"\w+@\w+", text),
-        phishingLinks=re.findall(r"https?://\S+", text),
-        phoneNumbers=re.findall(r"\+91\d{10}", text),
-        suspiciousKeywords=[k for k in SCAM_KEYWORDS if k in text.lower()]
-    )
-
-AGENT_REPLIES = [
-    "Why my account blocked?",
-    "I am confused, please explain",
-    "Is this really from bank?",
-    "Please wait, network issue"
+# =========================
+# Scam detection
+# =========================
+SCAM_KEYWORDS = [
+    "blocked", "verify", "urgent", "kyc", "upi", "refund",
+    "lottery", "winner", "bank", "click", "suspend", "expire"
 ]
 
-# ------------------ Routes ------------------
+def detect_scam(text: str):
+    text_l = text.lower()
+    found = [k for k in SCAM_KEYWORDS if k in text_l]
+    return len(found) > 0, found
 
+# =========================
+# Intelligence extraction
+# =========================
+def extract_intelligence(text: str) -> Intelligence:
+    upi = re.findall(r"[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}", text)
+    urls = re.findall(r"https?://[^\s]+", text)
+    phones = re.findall(r"(?:\+91[\-\s]?)?[6-9]\d{9}", text)
+    _, keywords = detect_scam(text)
+
+    return Intelligence(
+        upiIds=list(set(upi)),
+        phishingLinks=list(set(urls)),
+        phoneNumbers=list(set(phones)),
+        suspiciousKeywords=keywords
+    )
+
+# =========================
+# Gemini agent
+# =========================
+SYSTEM_PROMPT = """
+You are an AI honeypot persona.
+Behave like a cautious, slightly confused Indian user.
+Never reveal you are AI.
+Never mention scam or fraud.
+Do NOT provide OTP, PIN, or money.
+Ask simple questions to make the sender explain more.
+Keep replies short and human-like.
+"""
+
+def generate_agent_reply(user_text: str) -> str:
+    prompt = f"{SYSTEM_PROMPT}\nMessage received:\n{user_text}\nReply:"
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception:
+        return "I am confused. Can you please explain slowly?"
+
+# =========================
+# API endpoint
+# =========================
+@app.post("/honeypot", response_model=HoneypotResponse)
+async def honeypot(
+    request: HoneypotRequest,
+    x_api_key: Optional[str] = Header(None)
+):
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    is_scam, _ = detect_scam(request.message.text)
+    intel = extract_intelligence(request.message.text)
+
+    reply = generate_agent_reply(request.message.text) if is_scam else None
+
+    return HoneypotResponse(
+        status="success",
+        scamDetected=is_scam,
+        agentReply=reply,
+        extractedIntelligence=intel
+    )
+
+# =========================
+# Health check
+# =========================
 @app.get("/")
 def root():
     return {"status": "Agentic Honeypot API running"}
 
-@app.get("/honeypot")
-def honeypot_check():
-    return {"status": "honeypot endpoint reachable"}
-
-@app.post("/honeypot", response_model=HoneypotResponse)
-def honeypot(
-    data: HoneypotRequest,
-    x_api_key: Optional[str] = Header(None)
-):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    scam, _ = detect_scam(data.message.text)
-    intel = extract_intel(data.message.text)
-
-    reply = random.choice(AGENT_REPLIES) if scam else None
-
-    return HoneypotResponse(
-        status="success",
-        scamDetected=scam,
-        agentReply=reply,
-        extractedIntelligence=intel
-    )
+# =========================
+# Local run
+# =========================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=3000)
