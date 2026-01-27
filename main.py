@@ -16,7 +16,7 @@ API_KEY = os.getenv("API_KEY", "honeypot-secret-123")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# Gemini setup (safe)
+# Gemini setup (safe if key missing)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
@@ -74,33 +74,23 @@ def extract_intelligence(text: str):
 # ======================================================
 # CONFIDENCE SCORE (EXPLAINABLE)
 # ======================================================
-def calculate_confidence_score(
-    intelligence: dict,
-    scam_type: str,
-    message_count: int
-) -> float:
+def calculate_confidence_score(intelligence: dict, scam_type: str, message_count: int) -> float:
     score = 0.0
 
-    # Keywords
     score += min(len(intelligence.get("suspiciousKeywords", [])) * 0.1, 0.4)
 
-    # Scam type detected
     if scam_type != "UNKNOWN":
         score += 0.2
 
-    # Phishing link
     if intelligence.get("phishingLinks"):
         score += 0.15
 
-    # Phone number
     if intelligence.get("phoneNumbers"):
         score += 0.1
 
-    # UPI ID
     if intelligence.get("upiIds"):
         score += 0.15
 
-    # Multi-turn persistence
     if message_count >= 4:
         score += 0.1
 
@@ -194,14 +184,17 @@ def send_guvi_callback(session_id: str, total_messages: int, intelligence: dict,
     try:
         requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
     except Exception:
-        pass  # NEVER crash
+        pass  # never crash
 
 # ======================================================
 # ROUTES
 # ======================================================
-@app.get("/")
-def health():
-    return {"status": "Agentic Honeypot API running"}
+@app.api_route("/", methods=["GET", "POST", "HEAD"])
+async def root():
+    return {
+        "status": "Agentic Honeypot API running",
+        "note": "Use POST /honeypot for scam detection"
+    }
 
 @app.post("/honeypot")
 async def honeypot(request: Request, x_api_key: str = Header(None)):
