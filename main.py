@@ -1,5 +1,6 @@
 import os
 import re
+import requests
 from datetime import datetime
 from typing import Dict, List
 
@@ -9,12 +10,13 @@ import google.generativeai as genai
 import uvicorn
 
 # ======================================================
-# CONFIG (Environment Variables)
+# CONFIG
 # ======================================================
 API_KEY = os.getenv("API_KEY", "honeypot-secret-123")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# Gemini config (safe even if key missing)
+# Gemini setup (safe)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
@@ -24,9 +26,10 @@ else:
 app = FastAPI(title="Agentic Honeypot API", version="1.0.0")
 
 # ======================================================
-# IN-MEMORY SESSION STORE (multi-turn memory)
+# IN-MEMORY STORES
 # ======================================================
 SESSION_MEMORY: Dict[str, List[str]] = {}
+CALLBACK_SENT = set()
 
 # ======================================================
 # KEYWORDS & RULES
@@ -46,7 +49,7 @@ SCAM_TYPE_RULES = {
 }
 
 # ======================================================
-# UTILS
+# UTILITY FUNCTIONS
 # ======================================================
 def detect_scam(text: str):
     text_l = text.lower()
@@ -69,13 +72,46 @@ def extract_intelligence(text: str):
     }
 
 # ======================================================
+# CONFIDENCE SCORE (EXPLAINABLE)
+# ======================================================
+def calculate_confidence_score(
+    intelligence: dict,
+    scam_type: str,
+    message_count: int
+) -> float:
+    score = 0.0
+
+    # Keywords
+    score += min(len(intelligence.get("suspiciousKeywords", [])) * 0.1, 0.4)
+
+    # Scam type detected
+    if scam_type != "UNKNOWN":
+        score += 0.2
+
+    # Phishing link
+    if intelligence.get("phishingLinks"):
+        score += 0.15
+
+    # Phone number
+    if intelligence.get("phoneNumbers"):
+        score += 0.1
+
+    # UPI ID
+    if intelligence.get("upiIds"):
+        score += 0.15
+
+    # Multi-turn persistence
+    if message_count >= 4:
+        score += 0.1
+
+    return round(min(score, 1.0), 2)
+
+# ======================================================
 # LANGUAGE DETECTION
 # ======================================================
 def detect_language_style(text: str) -> str:
-    # Hindi (Devanagari)
     if re.search(r'[\u0900-\u097F]', text):
         return "HINDI"
-    # Hinglish (common Hindi words in English letters)
     if any(w in text.lower() for w in ["kyu", "kyon", "hai", "nahi", "kya", "ka", "ke"]):
         return "HINGLISH"
     return "ENGLISH"
@@ -89,7 +125,7 @@ You are non-technical, cautious, and slightly confused.
 You do NOT know about scams, AI, police, or security.
 You NEVER give OTP, PIN, passwords, or money.
 
-Behavior rules:
+Rules:
 - Reply in the SAME language style as the sender.
 - Hindi → Hindi (Devanagari).
 - Hinglish → Hinglish.
@@ -103,7 +139,7 @@ def build_memory_summary(session_id: str) -> str:
     history = SESSION_MEMORY.get(session_id, [])
     if not history:
         return "No prior conversation."
-    return " | ".join(history[-4:])  # last 4 messages only
+    return " | ".join(history[-4:])
 
 def gemini_reply(session_id: str, user_text: str) -> str:
     if not model:
@@ -139,6 +175,28 @@ Reply:
         return "Samajh nahi aa raha, thoda simple batana."
 
 # ======================================================
+# GUVI CALLBACK
+# ======================================================
+def send_guvi_callback(session_id: str, total_messages: int, intelligence: dict, scam_type: str):
+    payload = {
+        "sessionId": session_id,
+        "scamDetected": True,
+        "totalMessagesExchanged": total_messages,
+        "extractedIntelligence": {
+            "bankAccounts": [],
+            "upiIds": intelligence.get("upiIds", []),
+            "phishingLinks": intelligence.get("phishingLinks", []),
+            "phoneNumbers": intelligence.get("phoneNumbers", []),
+            "suspiciousKeywords": intelligence.get("suspiciousKeywords", [])
+        },
+        "agentNotes": f"Detected scam type: {scam_type}"
+    }
+    try:
+        requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+    except Exception:
+        pass  # NEVER crash
+
+# ======================================================
 # ROUTES
 # ======================================================
 @app.get("/")
@@ -148,14 +206,12 @@ def health():
 @app.post("/honeypot")
 async def honeypot(request: Request, x_api_key: str = Header(None)):
     try:
-        # Soft auth (never crash)
         if x_api_key != API_KEY:
             return JSONResponse(
                 status_code=200,
                 content={"status": "error", "message": "Invalid API key"}
             )
 
-        # Safe JSON parsing
         try:
             body = await request.json()
         except Exception:
@@ -164,37 +220,54 @@ async def honeypot(request: Request, x_api_key: str = Header(None)):
         session_id = body.get("sessionId", "unknown-session")
         msg = body.get("message", {})
         text = msg.get("text", "") or ""
-        timestamp = msg.get("timestamp") or datetime.utcnow().isoformat()
 
-        # Init session memory
         SESSION_MEMORY.setdefault(session_id, [])
         SESSION_MEMORY[session_id].append(f"Scammer: {text}")
 
-        # Core logic
         is_scam, _ = detect_scam(text)
         scam_type = classify_scam_type(text)
         intelligence = extract_intelligence(text)
+
+        confidence_score = calculate_confidence_score(
+            intelligence=intelligence,
+            scam_type=scam_type,
+            message_count=len(SESSION_MEMORY.get(session_id, []))
+        )
 
         agent_reply = None
         if is_scam:
             agent_reply = gemini_reply(session_id, text)
             SESSION_MEMORY[session_id].append(f"User: {agent_reply}")
 
+        if (
+            is_scam
+            and session_id not in CALLBACK_SENT
+            and len(SESSION_MEMORY.get(session_id, [])) >= 4
+        ):
+            send_guvi_callback(
+                session_id=session_id,
+                total_messages=len(SESSION_MEMORY.get(session_id, [])),
+                intelligence=intelligence,
+                scam_type=scam_type
+            )
+            CALLBACK_SENT.add(session_id)
+
         return {
             "status": "success",
             "sessionId": session_id,
             "scamDetected": is_scam,
             "scamType": scam_type,
+            "confidenceScore": confidence_score,
             "agentReply": agent_reply,
             "extractedIntelligence": intelligence
         }
 
     except Exception:
-        # Absolute fallback — NEVER crash
         return {
             "status": "success",
             "scamDetected": False,
             "scamType": "UNKNOWN",
+            "confidenceScore": 0.0,
             "agentReply": "Please explain again, I am not understanding.",
             "extractedIntelligence": {
                 "upiIds": [],
